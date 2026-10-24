@@ -26,10 +26,12 @@ const firebaseConfig = {
   databaseURL: "https://exam-planer-pro-default-rtdb.asia-southeast1.firebasedatabase.app" 
 };
 let db = null;
+let auth = null;
 try {
   if (typeof firebase !== "undefined") {
     firebase.initializeApp(firebaseConfig);
-    db = firebase.database();
+    db = firebase.firestore();
+    auth = firebase.auth();
   }
 } catch (e) {
   console.warn("Firebase Initialize Status:", e);
@@ -37,21 +39,131 @@ try {
 
 let store = loadStore();
 let deletedTxBackup = null;
-let currentCalDate = new Date(2026, 9, 1);
+let currentCalDate = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
 let syncDebounceTimer = null;
+let toastTimer = null;
+let cloudReady = false;
+let unsubscribeCloud = null;
+const OWNER_KEY = "moneysync_owner";
 
 const $ = id => document.getElementById(id);
 const money = n => new Intl.NumberFormat("th-TH", { style: "currency", currency: "THB" }).format(Number(n) || 0);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[c]));
 
+
+const THAI_MONTHS = ["มกราคม","กุมภาพันธ์","มีนาคม","เมษายน","พฤษภาคม","มิถุนายน","กรกฎาคม","สิงหาคม","กันยายน","ตุลาคม","พฤศจิกายน","ธันวาคม"];
+function pad2(n) { return String(n).padStart(2, "0"); }
+function todayStr() { const d = new Date(); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; }
+function monthKey(d) { return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`; }
+function pctOf(a, b) { return b > 0 ? Math.min(100, Math.round((a / b) * 100)) : 0; }
+
+// คงค่าที่เลือกไว้เมื่อสร้าง <option> ใหม่
+function fillSelect(el, html) {
+  if (!el) return;
+  const prev = el.value;
+  el.innerHTML = html;
+  if (prev && [...el.options].some(o => o.value === prev)) el.value = prev;
+}
+
+// ตรวจและทำความสะอาดข้อมูล (ใช้ตอนโหลด / ดึงจาก Cloud / นำเข้าไฟล์)
+function normalizeStore(s) {
+  s = s && typeof s === "object" ? s : {};
+  const arr = v => Array.isArray(v) ? v : (v && typeof v === "object" ? Object.values(v) : []);
+  const sid = v => String(v ?? "").replace(/[^\w-]/g, "");
+  const isDate = d => /^\d{4}-\d{2}-\d{2}$/.test(String(d));
+  const out = { version: 2, updatedAt: Number(s.updatedAt) || 0 };
+
+  out.wallets = arr(s.wallets).filter(w => w && sid(w.id))
+    .map(w => ({ id: sid(w.id), name: String(w.name || "บัญชี").slice(0, 40), type: String(w.type || "cash") }));
+  if (!out.wallets.length) out.wallets = [
+    { id: "w_cash", name: "💵 เงินสด", type: "cash" },
+    { id: "w_bank", name: "🏦 ธนาคาร", type: "bank" },
+    { id: "w_card", name: "💳 บัตรเครดิต", type: "credit" },
+    { id: "w_ewallet", name: "📱 e-Wallet", type: "ewallet" }
+  ];
+
+  out.transactions = arr(s.transactions).filter(t => t && isDate(t.date) && Number(t.amount) > 0)
+    .map(t => ({
+      id: sid(t.id) || crypto.randomUUID(),
+      type: t.type === "income" ? "income" : "expense",
+      amount: Number(t.amount),
+      title: String(t.title || "").slice(0, 80),
+      category: String(t.category || "🎁 อื่น ๆ"),
+      walletId: sid(t.walletId) || "w_cash",
+      date: String(t.date),
+      note: String(t.note || "").slice(0, 120),
+      createdAt: Number(t.createdAt) || Date.now(),
+      updatedAt: Number(t.updatedAt) || Date.now()
+    }));
+
+  out.budgets = arr(s.budgets).filter(b => b && sid(b.id) && Number(b.amount) > 0)
+    .map(b => ({ id: sid(b.id), category: String(b.category || ""), amount: Number(b.amount) }));
+
+  out.goals = arr(s.goals).filter(g => g && sid(g.id) && Number(g.targetAmount) > 0)
+    .map(g => ({ id: sid(g.id), title: String(g.title || "").slice(0, 80), targetAmount: Number(g.targetAmount),
+      currentAmount: Number(g.currentAmount) || 0, deadline: String(g.deadline || "") }));
+
+  out.recurring = arr(s.recurring).filter(r => r && sid(r.id) && Number(r.amount) > 0)
+    .map(r => ({ id: sid(r.id), title: String(r.title || "").slice(0, 80), amount: Number(r.amount),
+      type: r.type === "income" ? "income" : "expense", category: String(r.category || "🎁 อื่น ๆ"),
+      walletId: sid(r.walletId) || "w_bank",
+      dayOfMonth: Math.min(31, Math.max(1, Number(r.dayOfMonth) || 1)),
+      lastGeneratedMonth: String(r.lastGeneratedMonth || "") }));
+  return out;
+}
+
+function mergeStores(a, b) {
+  const byId = (x, y) => { const m = new Map(x.map(i => [i.id, i])); y.forEach(i => { if (!m.has(i.id)) m.set(i.id, i); }); return [...m.values()]; };
+  return { ...a, wallets: byId(a.wallets, b.wallets), transactions: byId(a.transactions, b.transactions),
+    budgets: byId(a.budgets, b.budgets), goals: byId(a.goals, b.goals), recurring: byId(a.recurring, b.recurring) };
+}
+
 // ==================== USER ID MANAGEMENT ====================
-function getOrInitUserId() {
-  let uid = localStorage.getItem("moneysync.user.id");
-  if (!uid) {
-    uid = "user_" + Math.random().toString(36).substring(2, 9) + "_" + Date.now();
-    localStorage.setItem("moneysync.user.id", uid);
-  }
-  return uid;
+function setSyncStatus(text) {
+  const el = $("syncStatusText");
+  if (el) el.textContent = "สถานะ: " + text;
+}
+function authLabel() {
+  const u = auth && auth.currentUser;
+  return u ? (u.email || u.displayName || "ล็อกอินแล้ว") : "ยังไม่ได้ล็อกอิน";
+}
+function cloudDoc() {
+  const u = auth && auth.currentUser;
+  return db && u ? db.collection("users").doc(u.uid) : null;   // 1 บัญชี Google = 1 เอกสาร
+}
+function readCloud(snap) {
+  if (!snap || !snap.exists) return null;
+  try { return normalizeStore(JSON.parse(snap.data().json)); } catch (e) { return null; }
+}
+function updateAccountUI() {
+  const u = auth && auth.currentUser;
+  const info = $("accountInfo");
+  if (info) info.textContent = u ? `บัญชีที่ใช้ซิงค์: ${authLabel()}` : "ยังไม่ได้ล็อกอิน — ข้อมูลเก็บเฉพาะในเครื่องนี้";
+  const li = $("googleLoginBtn"), lo = $("logoutBtn");
+  if (li) li.classList.toggle("hidden", !!u);
+  if (lo) lo.classList.toggle("hidden", !u);
+}
+function mergeNewest(a, b) {
+  const by = (x, y) => {
+    const m = new Map(x.map(i => [i.id, i]));
+    y.forEach(i => { const o = m.get(i.id); if (!o || (i.updatedAt || 0) > (o.updatedAt || 0)) m.set(i.id, i); });
+    return [...m.values()];
+  };
+  return { ...a, updatedAt: Date.now(), wallets: by(a.wallets, b.wallets), transactions: by(a.transactions, b.transactions),
+    budgets: by(a.budgets, b.budgets), goals: by(a.goals, b.goals), recurring: by(a.recurring, b.recurring) };
+}
+function stopListening() { if (unsubscribeCloud) { unsubscribeCloud(); unsubscribeCloud = null; } }
+function startListening(ref) {
+  stopListening();
+  unsubscribeCloud = ref.onSnapshot(snap => {
+    if (snap.metadata.hasPendingWrites || !cloudReady) return;
+    const cloud = readCloud(snap);
+    if (cloud && cloud.updatedAt > (store.updatedAt || 0)) {
+      applyCloudStore(cloud);
+      setSyncStatus(`🟢 ซิงค์เรียบร้อย (${authLabel()})`);
+      showToast("อัปเดตข้อมูลจากอุปกรณ์อื่นแล้ว ✓");
+    }
+  }, err => console.warn("Listen error:", err));
 }
 
 // ==================== DATA MIGRATION & STORAGE ====================
@@ -60,7 +172,7 @@ function loadStore() {
   const v2Raw = localStorage.getItem(KEY_V2);
 
   if (v2Raw) {
-    try { return JSON.parse(v2Raw); } catch (e) { console.error(e); }
+    try { return normalizeStore(JSON.parse(v2Raw)); } catch (e) { console.error(e); }
   }
 
   // Safe Migration จาก Local Storage เดิม
@@ -86,6 +198,7 @@ function loadStore() {
 
   const initialStore = {
     version: 2,
+    updatedAt: 0,
     wallets: [
       { id: "w_cash", name: "💵 เงินสด", type: "cash" },
       { id: "w_bank", name: "🏦 ธนาคาร", type: "bank" },
@@ -106,77 +219,134 @@ function loadStore() {
 
 // Save On Change + Debounce Cloud Sync (2 วิ)
 function saveStore() {
-  localStorage.setItem(KEY_V2, JSON.stringify(store));
   processRecurring();
-
-  const statusEl = $("syncStatusText");
-  if (statusEl) statusEl.textContent = "สถานะ: 🟡 มีการเปลี่ยนแปลง (รอยืนยันซิงค์...)";
-
+  store.updatedAt = Date.now();
+  localStorage.setItem(KEY_V2, JSON.stringify(store));
+  setSyncStatus("🟡 มีการเปลี่ยนแปลง (รอซิงค์...)");
   clearTimeout(syncDebounceTimer);
-  syncDebounceTimer = setTimeout(() => {
-    syncToCloud();
-  }, 2000);
+  syncDebounceTimer = setTimeout(syncToCloud, 2000);
 }
 
 // ==================== FIREBASE CLOUD SYNC ====================
 function syncToCloud() {
-  if (!db) {
-    const statusEl = $("syncStatusText");
-    if (statusEl) statusEl.textContent = "สถานะ: 🔴 ออฟไลน์ (บันทึกเฉพาะในเครื่อง)";
-    return;
+  if (!cloudReady) return Promise.resolve();
+  return pushStore();
+}
+
+function pushStore() {
+  const ref = cloudDoc();
+  if (!ref) {
+    setSyncStatus("🟡 ใช้ข้อมูลในเครื่อง (ล็อกอิน Google เพื่อซิงค์ข้ามเครื่อง)");
+    return Promise.resolve();
   }
-
-  const statusEl = $("syncStatusText");
-  if (statusEl) statusEl.textContent = "สถานะ: 🔄 กำลังส่งข้อมูลไปยัง Firebase...";
-
-  const userId = getOrInitUserId();
-
-  db.ref(`users/${userId}/store`).set(store)
-    .then(() => {
-      if (statusEl) statusEl.textContent = `สถานะ: 🟢 เชื่อมต่อ Cloud เรียบร้อย (ID: ${userId})`;
-    })
+  setSyncStatus("🔄 กำลังส่งข้อมูลไปยัง Firebase...");
+  return ref.set({ json: JSON.stringify(store), updatedAt: store.updatedAt || 0, email: auth.currentUser.email || "" })
+    .then(() => setSyncStatus(`🟢 ซิงค์เรียบร้อย (${authLabel()})`))
     .catch(err => {
       console.warn("Cloud Sync Error:", err);
-      if (statusEl) statusEl.textContent = `สถานะ: 🔴 บันทึกลง Cloud ไม่สำเร็จ (${err.message})`;
+      setSyncStatus(`🔴 ซิงค์ไม่สำเร็จ (${err.code || err.message})`);
     });
 }
 
-function pullFromCloud() {
-  if (!db) {
-    alert("ไม่สามารถเชื่อมต่อ Firebase ได้ในขณะนี้");
+function applyCloudStore(cloud) {
+  store = cloud;
+  localStorage.setItem(KEY_V2, JSON.stringify(store));
+  renderAll();
+}
+
+// เปิดแอป: ล็อกอินแบบไม่ระบุตัวตน -> เทียบเวลา -> ใช้ข้อมูลที่ใหม่กว่า (ไม่เขียนทับมั่ว)
+// ทำงานเมื่อล็อกอิน/เปิดแอป: ข้อมูลผูกกับบัญชี Google (uid) ไม่ปนกันระหว่างบัญชี
+async function initialSync() {
+  const ref = cloudDoc();
+  if (!ref) {
+    cloudReady = false;
+    stopListening();
+    setSyncStatus("🟡 ใช้ข้อมูลในเครื่อง (ล็อกอิน Google เพื่อซิงค์ข้ามเครื่อง)");
     return;
   }
+  try {
+    setSyncStatus("🔄 กำลังตรวจสอบข้อมูลบน Cloud...");
+    const uid = auth.currentUser.uid;
+    const cloud = readCloud(await ref.get());
+    const owner = localStorage.getItem(OWNER_KEY);
+    if (owner && owner !== uid) { store = normalizeStore({}); }   // ข้อมูลในเครื่องเป็นของบัญชีอื่น: ไม่เอามาปนกัน
+    const hasLocal = store.transactions.length || store.budgets.length || store.goals.length || store.recurring.length;
 
-  const userId = getOrInitUserId();
+    if (!cloud) {
+      // บัญชีนี้ยังไม่มีข้อมูลบน Cloud -> อัปโหลดข้อมูลในเครื่อง
+    } else if (owner === uid) {
+      if (cloud.updatedAt > (store.updatedAt || 0)) store = cloud;
+    } else if (hasLocal) {
+      store = mergeNewest(cloud, store);       // ล็อกอินครั้งแรกบนเครื่องที่มีข้อมูลอยู่แล้ว: รวมตาม id
+    } else {
+      store = cloud;
+    }
+    localStorage.setItem(OWNER_KEY, uid);
+    localStorage.setItem(KEY_V2, JSON.stringify(store));
+    renderAll();
+    cloudReady = true;
+    await pushStore();
+    startListening(ref);
+  } catch (err) {
+    console.warn("Initial sync error:", err);
+    setSyncStatus(`🔴 เชื่อมต่อ Cloud ไม่ได้ (${err.code || err.message})`);
+  }
+}
 
-  db.ref(`users/${userId}/store`).once("value")
-    .then(snapshot => {
-      const cloudData = snapshot.val();
-      if (cloudData && cloudData.transactions) {
-        if (confirm("พบข้อมูลบน Cloud ต้องการนำมาทับข้อมูลในเครื่องใช่หรือไม่?")) {
-          store = cloudData;
-          localStorage.setItem(KEY_V2, JSON.stringify(store));
-          renderAll();
-          showToast("ดึงข้อมูลจาก Cloud สำเร็จ ✓");
-        }
-      } else {
-        alert("ยังไม่มีข้อมูลบน Cloud");
-      }
-    })
-    .catch(err => alert("ดึงข้อมูลไม่สำเร็จ: " + err.message));
+async function googleLogin() {
+  if (!auth) { alert("ยังเชื่อมต่อ Firebase ไม่ได้"); return; }
+  const provider = new firebase.auth.GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: "select_account" });
+  try {
+    await auth.signInWithPopup(provider);          // สำเร็จแล้ว onAuthStateChanged จะเรียก initialSync เอง
+  } catch (err) {
+    if (err.code === "auth/popup-blocked" || err.code === "auth/operation-not-supported-in-this-environment") {
+      return auth.signInWithRedirect(provider);
+    }
+    if (err.code === "auth/popup-closed-by-user" || err.code === "auth/cancelled-popup-request") return;
+    alert("ล็อกอินไม่สำเร็จ: " + (err.code || err.message) +
+      (err.code === "auth/unauthorized-domain" ? "\nต้องเพิ่มโดเมนนี้ใน Firebase → Authentication → Settings → Authorized domains" : ""));
+  }
+}
+
+async function logout() {
+  if (!auth || !auth.currentUser) return;
+  if (!confirm("ออกจากระบบ? ข้อมูลในเครื่องนี้จะถูกล้าง (ข้อมูลยังอยู่บน Cloud ของบัญชีนี้)")) return;
+  try { if (cloudReady) await pushStore(); } catch (e) {}
+  stopListening();
+  cloudReady = false;
+  await auth.signOut();
+  store = normalizeStore({});
+  localStorage.setItem(KEY_V2, JSON.stringify(store));
+  localStorage.removeItem(OWNER_KEY);
+  renderAll();
+  updateAccountUI();
+  setSyncStatus("🟡 ออกจากระบบแล้ว (ใช้ข้อมูลในเครื่อง)");
+}
+
+async function pullFromCloud() {
+  const ref = cloudDoc();
+  if (!ref) { alert("ต้องล็อกอินด้วย Google ก่อน"); return; }
+  try {
+    const cloud = readCloud(await ref.get());
+    if (!cloud) { alert("ยังไม่มีข้อมูลบน Cloud"); return; }
+    if (!confirm("นำข้อมูลจาก Cloud มาทับข้อมูลในเครื่องใช่หรือไม่?")) return;
+    applyCloudStore(cloud);
+    showToast("ดึงข้อมูลจาก Cloud สำเร็จ ✓");
+  } catch (err) {
+    alert("ดึงข้อมูลไม่สำเร็จ: " + (err.code || err.message));
+  }
 }
 
 // ==================== RECURRING ENGINE ====================
 function processRecurring() {
   const today = new Date();
-  const currentMonthKey = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}`;
+  const mk = monthKey(today);
+  const lastDay = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
   let added = false;
-
-  if (!store.recurring) store.recurring = [];
-
   store.recurring.forEach(rec => {
-    if (rec.lastGeneratedMonth !== currentMonthKey && today.getDate() >= rec.dayOfMonth) {
-      const txDate = `${currentMonthKey}-${String(rec.dayOfMonth).padStart(2, '0')}`;
+    const day = Math.min(Math.max(Number(rec.dayOfMonth) || 1, 1), lastDay);
+    if (rec.lastGeneratedMonth !== mk && today.getDate() >= day) {
       store.transactions.push({
         id: crypto.randomUUID(),
         type: rec.type,
@@ -184,17 +354,16 @@ function processRecurring() {
         title: rec.title,
         category: rec.category,
         walletId: rec.walletId || "w_bank",
-        date: txDate,
+        date: `${mk}-${pad2(day)}`,
         note: "รายการประจำอัตโนมัติ",
         createdAt: Date.now(),
         updatedAt: Date.now()
       });
-      rec.lastGeneratedMonth = currentMonthKey;
+      rec.lastGeneratedMonth = mk;
       added = true;
     }
   });
-
-  if (added) localStorage.setItem(KEY_V2, JSON.stringify(store));
+  return added;
 }
 
 window.delRecurring = function(id) {
@@ -230,6 +399,25 @@ window.delGoal = function(id) {
   showToast("ลบเป้าหมายแล้ว ✓");
 };
 
+window.addGoalAmount = function(id) {
+  const g = store.goals.find(x => x.id === id);
+  if (!g) return;
+  const v = parseFloat(String(prompt(`เพิ่มเงินออมให้ "${g.title}" (บาท)`) || "").replace(/,/g, ""));
+  if (!(v > 0)) return;
+  g.currentAmount = Number(g.currentAmount) + v;
+  saveStore();
+  renderSettings();
+  showToast("อัปเดตเป้าหมายแล้ว ✓");
+};
+
+function resetTxForm() {
+  $("txForm").reset();
+  $("txId").value = "";
+  $("date").value = todayStr();
+  $("formTxTitle").textContent = "➕ บันทึกรายการ";
+  updateDropdowns();
+}
+
 // ==================== ROUTING & TABS ====================
 function switchTab(tabId) {
   document.querySelectorAll(".tab-content").forEach(el => el.classList.remove("active"));
@@ -255,37 +443,34 @@ function switchTab(tabId) {
 
 // ==================== SMART ADD ====================
 function parseSmartAdd(text) {
-  const parts = text.trim().split(/\s+/);
-  if (parts.length < 2) return null;
+  const t = text.trim().replace(/\s*บาท$/, "").split(/\s+/);
+  if (t.length < 2) return null;
+  const num = s => {
+    s = s.replace(/^฿|บาท$/g, "").replace(/,/g, "");
+    return /^\d+(\.\d+)?$/.test(s) ? parseFloat(s) : NaN;
+  };
+  let amount = num(t[t.length - 1]);
+  let title;
+  if (!isNaN(amount)) title = t.slice(0, -1).join(" ");
+  else { amount = num(t[0]); title = t.slice(1).join(" "); }
+  if (isNaN(amount) || amount <= 0 || !title) return null;
 
-  const lastPart = parts[parts.length - 1];
-  const amount = parseFloat(lastPart);
-  if (isNaN(amount)) return null;
-
-  const title = parts.slice(0, parts.length - 1).join(" ");
   let type = "expense";
   let category = "🎁 อื่น ๆ";
-
-  if (/เงินเดือน|รายได้|โบนัส|ขาย|ปันผล/.test(title)) {
-    type = "income";
-    category = "💼 เงินเดือน";
-  } else if (/ข้าว|อาหาร|กาแฟ|ชา|ก๋วยเตี๋ยว|ชาบู/.test(title)) {
-    category = "🍚 อาหาร";
-  } else if (/รถ|เดินทาง|น้ำมัน|แท็กซี่|BTS|MRT|Grab/.test(title)) {
-    category = "🚗 เดินทาง";
-  }
+  if (/เงินเดือน|โบนัส/.test(title)) { type = "income"; category = "💼 เงินเดือน"; }
+  else if (/ปันผล|ดอกเบี้ย|ลงทุน/.test(title)) { type = "income"; category = "📈 ดอกเบี้ย / ปันผล / ลงทุน"; }
+  else if (/ขาย|รายได้/.test(title)) { type = "income"; category = "🏷️ ขายของ / รายได้เสริม"; }
+  else if (/ข้าว|อาหาร|กาแฟ|ชานม|ชาไข่มุก|ก๋วยเตี๋ยว|ชาบู|น้ำ|ขนม/.test(title)) category = "🍚 อาหาร";
+  else if (/รถ|เดินทาง|น้ำมัน|แท็กซี่|BTS|MRT|Grab|วิน/i.test(title)) category = "🚗 เดินทาง";
+  else if (/หนัง|เกม|Netflix|Spotify/i.test(title)) category = "🎬 ความบันเทิง";
+  else if (/ค่าไฟ|ค่าน้ำ|เน็ต|อินเทอร์เน็ต|บิล|ค่าโทรศัพท์/.test(title)) category = "💳 บิล/อินเทอร์เน็ต";
+  else if (/ยา|หมอ|โรงพยาบาล|คลินิก/.test(title)) category = "🏥 สุขภาพ/ยา";
+  else if (/เสื้อ|กางเกง|รองเท้า|ช้อป/.test(title)) category = "🛍️ ช้อปปิ้ง";
 
   return {
-    id: crypto.randomUUID(),
-    type,
-    amount,
-    title,
-    category,
-    walletId: "w_cash",
-    date: new Date().toISOString().slice(0, 10),
-    note: "Smart Quick Add",
-    createdAt: Date.now(),
-    updatedAt: Date.now()
+    id: crypto.randomUUID(), type, amount, title, category,
+    walletId: "w_cash", date: todayStr(), note: "Smart Quick Add",
+    createdAt: Date.now(), updatedAt: Date.now()
   };
 }
 
@@ -301,18 +486,109 @@ function renderAll() {
 function updateDropdowns() {
   const typeEl = document.querySelector('input[name="type"]:checked');
   const type = typeEl ? typeEl.value : "expense";
+  const recType = $("recType").value === "income" ? "income" : "expense";
+  const opt = c => `<option value="${esc(c)}">${esc(c)}</option>`;
+  const walletOpts = store.wallets.map(w => `<option value="${esc(w.id)}">${esc(w.name)}</option>`).join("");
 
-  $("category").innerHTML = CATEGORIES[type].map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
-  $("walletSelect").innerHTML = store.wallets.map(w => `<option value="${w.id}">${esc(w.name)}</option>`).join("");
-  
-  const allCats = [...CATEGORIES.expense, ...CATEGORIES.income];
-  $("filterCategory").innerHTML = `<option value="all">ทุกหมวดหมู่</option>` + allCats.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
-  $("filterWallet").innerHTML = `<option value="all">ทุกบัญชีเงิน</option>` + store.wallets.map(w => `<option value="${esc(w.id)}">${esc(w.name)}</option>`).join("");
-  $("budgetCategorySelect").innerHTML = CATEGORIES.expense.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
-  $("recCategory").innerHTML = CATEGORIES.expense.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+  fillSelect($("category"), CATEGORIES[type].map(opt).join(""));
+  fillSelect($("walletSelect"), walletOpts);
+  fillSelect($("recWallet"), walletOpts);
+  fillSelect($("recCategory"), CATEGORIES[recType].map(opt).join(""));
+  fillSelect($("budgetCategorySelect"), CATEGORIES.expense.map(opt).join(""));
+  fillSelect($("filterCategory"), `<option value="all">ทุกหมวดหมู่</option>` + [...CATEGORIES.expense, ...CATEGORIES.income].map(opt).join(""));
+  fillSelect($("filterWallet"), `<option value="all">ทุกบัญชีเงิน</option>` + walletOpts);
+}
+
+
+// กราฟวงกลมสัดส่วนรายจ่ายเดือนนี้ (Donut)
+function renderDonut() {
+  const box = $("donutChart");
+  if (!box) return;
+  const mk = monthKey(new Date());
+  const byCat = {};
+  store.transactions.filter(r => r.type === "expense" && r.date.startsWith(mk))
+    .forEach(r => { byCat[r.category] = (byCat[r.category] || 0) + r.amount; });
+  const total = Object.values(byCat).reduce((s, v) => s + v, 0);
+  if (!total) { box.innerHTML = '<p class="muted">ยังไม่มีรายจ่ายในเดือนนี้</p>'; return; }
+
+  const PALETTE = ["#4f46e5", "#0ea5e9", "#f59e0b", "#ec4899", "#8b5cf6", "#14b8a6"];
+  let items = Object.entries(byCat).sort((a, b) => b[1] - a[1]).map(([name, v], i) => ({ name, v, color: PALETTE[i % PALETTE.length] }));
+  if (items.length > 5) {
+    const rest = items.slice(5).reduce((s, x) => s + x.v, 0);
+    items = items.slice(0, 5);
+    items.push({ name: "อื่น ๆ", v: rest, color: "#94a3b8" });
+  }
+
+  const R = 70, C = 2 * Math.PI * R;
+  let off = 0;
+  const segs = items.map(x => {
+    const len = (x.v / total) * C;
+    const s = `<circle cx="90" cy="90" r="${R}" fill="none" stroke="${x.color}" stroke-width="28" stroke-dasharray="${len.toFixed(2)} ${(C - len).toFixed(2)}" stroke-dashoffset="${(-off).toFixed(2)}"/>`;
+    off += len;
+    return s;
+  }).join("");
+  const legend = items.map(x => `<li><span class="dn-dot" style="background:${x.color}"></span><span class="dn-name">${esc(x.name)}</span><span class="dn-val">${esc(money(x.v))} · ${Math.round((x.v / total) * 100)}%</span></li>`).join("");
+
+  box.innerHTML = `<div class="donut-wrap">
+    <svg viewBox="0 0 180 180" role="img" aria-label="สัดส่วนรายจ่ายเดือนนี้ รวม ${esc(money(total))}">
+      <g transform="rotate(-90 90 90)">${segs}</g>
+      <text class="dn-sub" x="90" y="86" text-anchor="middle">รายจ่ายรวม</text>
+      <text class="dn-total" x="90" y="106" text-anchor="middle">${esc(money(total))}</text>
+    </svg>
+    <ul class="donut-legend">${legend}</ul>
+  </div>`;
+}
+
+// ผังกระแสเงินเดือนนี้ (Sankey: รายรับ -> หมวดรายจ่าย / เหลือเก็บ)
+function renderCashFlow() {
+  const box = $("cashFlowChart");
+  if (!box) return;
+  const mk = monthKey(new Date());
+  const rows = store.transactions.filter(r => r.date.startsWith(mk));
+  const inc = rows.filter(r => r.type === "income").reduce((s, r) => s + r.amount, 0);
+  const byCat = {};
+  rows.filter(r => r.type === "expense").forEach(r => { byCat[r.category] = (byCat[r.category] || 0) + r.amount; });
+  const exp = Object.values(byCat).reduce((s, v) => s + v, 0);
+  if (!inc && !exp) { box.innerHTML = '<p class="muted">ยังไม่มีรายการในเดือนนี้</p>'; return; }
+
+  const PALETTE = ["#4f46e5", "#0ea5e9", "#f59e0b", "#ec4899", "#8b5cf6", "#14b8a6"];
+  let items = Object.entries(byCat).sort((a, b) => b[1] - a[1]).map(([name, v], i) => ({ name, v, color: PALETTE[i % PALETTE.length] }));
+  if (items.length > 5) {
+    const rest = items.slice(5).reduce((s, x) => s + x.v, 0);
+    items = items.slice(0, 5);
+    items.push({ name: "อื่น ๆ", v: rest, color: "#94a3b8" });
+  }
+  if (inc > exp) items.push({ name: "💰 เหลือเก็บ", v: inc - exp, color: "#16a34a" });
+
+  const total = Math.max(inc, exp), H = 200, MIN = 36;
+  const slots = items.map(x => Math.max(MIN, (x.v / total) * H));
+  const svgH = Math.max(H, slots.reduce((s, v) => s + v, 0)) + 8;
+  const top = (svgH - H) / 2;
+  let ly = top, ry = 4, paths = "", nodes = "", labels = "";
+
+  items.forEach((x, i) => {
+    const h = Math.max(1.5, (x.v / total) * H);
+    const ry0 = ry + (slots[i] - h) / 2, cy = ry + slots[i] / 2;
+    paths += `<path d="M100,${ly} C195,${ly} 195,${ry0} 290,${ry0} L290,${ry0 + h} C195,${ry0 + h} 195,${ly + h} 100,${ly + h} Z" fill="${x.color}" opacity="0.35"/>`;
+    nodes += `<rect x="290" y="${ry0}" width="12" height="${h}" rx="2" fill="${x.color}"/>`;
+    labels += `<text class="cf-label" x="310" y="${cy - 2}">${esc(x.name)}</text><text class="cf-sub" x="310" y="${cy + 12}">${esc(money(x.v))} · ${Math.round((x.v / total) * 100)}%</text>`;
+    ly += h; ry += slots[i];
+  });
+
+  const incH = (inc / total) * H;
+  let src = "";
+  if (inc > 0) src += `<rect x="88" y="${top}" width="12" height="${incH}" rx="2" fill="#16a34a"/><text class="cf-src" x="82" y="${top + incH / 2 - 2}">รายรับ</text><text class="cf-sub cf-src" x="82" y="${top + incH / 2 + 12}">${esc(money(inc))}</text>`;
+  if (exp > inc) src += `<rect x="88" y="${top + incH}" width="12" height="${H - incH}" rx="2" fill="#dc2626"/><text class="cf-src cf-neg" x="82" y="${top + incH + (H - incH) / 2 + 4}">ใช้เกิน</text>`;
+
+  const note = exp > inc
+    ? `ใช้จ่ายเกินรายรับ ${money(exp - inc)} ในเดือนนี้`
+    : `ออมได้ ${Math.round(((inc - exp) / inc) * 100)}% ของรายรับเดือนนี้`;
+  box.innerHTML = `<svg viewBox="0 0 480 ${svgH}" role="img" aria-label="ผังกระแสเงินเดือนนี้: รายรับ ${money(inc)} รายจ่าย ${money(exp)}">${paths}${nodes}${src}${labels}</svg><p class="muted-sm">${esc(note)}</p>`;
 }
 
 function renderDashboard() {
+  renderDonut();
+  renderCashFlow();
   const now = new Date();
   const thisMK = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
   
@@ -350,18 +626,19 @@ function renderDashboard() {
 }
 
 function txHtml(r) {
-  const walletObj = store.wallets.find(w => w.id === r.walletId);
-  const wName = walletObj ? walletObj.name : "";
+  const w = store.wallets.find(x => x.id === r.walletId);
+  const id = esc(r.id);
+  const kind = r.type === "income" ? "income" : "expense";
   return `<div class="transaction">
-    <div class="tx-icon">${r.type === "income" ? "🟢" : "🔴"}</div>
+    <div class="tx-icon">${kind === "income" ? "🟢" : "🔴"}</div>
     <div class="tx-info">
       <div class="tx-title">${esc(r.title)}</div>
-      <div class="tx-meta">${esc(r.category)} • ${esc(wName)} • ${r.date} ${r.note ? `(${esc(r.note)})` : ''}</div>
+      <div class="tx-meta">${esc(r.category)} • ${esc(w ? w.name : "")} • ${esc(r.date)} ${r.note ? `(${esc(r.note)})` : ""}</div>
     </div>
-    <div class="tx-amount ${r.type}">${r.type === "income" ? "+" : "−"}${money(r.amount)}</div>
+    <div class="tx-amount ${kind}">${kind === "income" ? "+" : "−"}${money(r.amount)}</div>
     <div class="tx-actions">
-      <button onclick="editTx('${r.id}')" class="icon-sm" title="แก้ไข">✏️</button>
-      <button onclick="delTx('${r.id}')" class="icon-sm delete" title="ลบ">🗑️</button>
+      <button data-act="edit" data-id="${id}" class="icon-sm" title="แก้ไข" aria-label="แก้ไข">✏️</button>
+      <button data-act="del" data-id="${id}" class="icon-sm delete" title="ลบ" aria-label="ลบ">🗑️</button>
     </div>
   </div>`;
 }
@@ -369,28 +646,20 @@ function txHtml(r) {
 window.delTx = function(id) {
   const idx = store.transactions.findIndex(r => r.id === id);
   if (idx === -1) return;
-  const item = store.transactions[idx];
-
-  if (!confirm(`ยืนยันการลบ "${item.title}" จำนวน ${money(item.amount)}?`)) return;
-
-  deletedTxBackup = { item, index: idx };
+  deletedTxBackup = { item: store.transactions[idx], index: idx };
   store.transactions.splice(idx, 1);
   saveStore();
   renderAll();
-
   showToast("ลบรายการเรียบร้อย", true);
 };
 
 function showToast(msg, showUndo = false) {
   const t = $("toast");
   $("toastMsg").textContent = msg;
-  const undo = $("undoBtn");
-  
-  if (showUndo) undo.classList.remove("hidden");
-  else undo.classList.add("hidden");
-
+  $("undoBtn").classList.toggle("hidden", !showUndo);
   t.classList.add("show");
-  setTimeout(() => t.classList.remove("show"), 3500);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove("show"), showUndo ? 6000 : 3000);
 }
 
 window.editTx = function(id) {
@@ -416,14 +685,15 @@ window.editTx = function(id) {
 
 // ==================== HISTORY ====================
 function renderHistory() {
+  const curYear = String(new Date().getFullYear());
   const years = [...new Set(store.transactions.map(r => r.date.slice(0, 4)))].sort((a, b) => b - a);
-  if (!years.includes("2026")) years.push("2026");
+  if (!years.includes(curYear)) { years.push(curYear); years.sort((a, b) => b - a); }
 
   const yearSelect = $("historyYearSelect");
-  const curSelected = yearSelect.value || "2026";
+  const curSelected = yearSelect.value || curYear;
   yearSelect.innerHTML = years.map(y => `<option value="${y}" ${y === curSelected ? "selected" : ""}>${y}</option>`).join("");
 
-  const selectedYear = yearSelect.value || "2026";
+  const selectedYear = yearSelect.value || curYear;
   const yearTx = store.transactions.filter(r => r.date.startsWith(selectedYear));
   const yearInc = yearTx.filter(r => r.type === "income").reduce((a, b) => a + b.amount, 0);
   const yearExp = yearTx.filter(r => r.type === "expense").reduce((a, b) => a + b.amount, 0);
@@ -444,7 +714,7 @@ function renderHistory() {
     const mExp = mTx.filter(r => r.type === "expense").reduce((a, b) => a + b.amount, 0);
 
     return `<div class="month-row">
-      <div class="month-name">${mk}</div>
+      <div class="month-name">${THAI_MONTHS[Number(m) - 1]} ${esc(selectedYear)}</div>
       <div class="month-stats">
         <span class="inc">+${money(mInc)}</span>
         <span class="exp">−${money(mExp)}</span>
@@ -483,7 +753,7 @@ function renderFilteredTx() {
 function renderCalendar() {
   const y = currentCalDate.getFullYear();
   const m = currentCalDate.getMonth();
-  $("calMonthTitle").textContent = `${currentCalDate.toLocaleString('en', { month: 'long' })} ${y}`;
+  $("calMonthTitle").textContent = `${currentCalDate.toLocaleString('th-TH', { month: 'long' })} ${y}`;
 
   const firstDay = new Date(y, m, 1).getDay();
   const daysInMonth = new Date(y, m + 1, 0).getDate();
@@ -496,7 +766,7 @@ function renderCalendar() {
     const dayTx = store.transactions.filter(r => r.date === dateStr);
     const hasExp = dayTx.some(r => r.type === "expense");
 
-    html += `<div class="cal-day ${hasExp ? 'has-exp' : ''}" onclick="selectCalDay('${dateStr}')">
+    html += `<div class="cal-day ${hasExp ? 'has-exp' : ''}" data-act="day" data-id="${dateStr}">
       <span>${d}</span>
       ${hasExp ? '<div class="dot"></div>' : ''}
     </div>`;
@@ -516,28 +786,29 @@ window.selectCalDay = function(dateStr) {
 
 // ==================== ANALYTICS ====================
 function renderAnalytics() {
-  const years = [...new Set(store.transactions.map(r => r.date.slice(0, 4)))].sort();
-  if (!years.includes("2025")) years.push("2025");
-  if (!years.includes("2026")) years.push("2026");
+  const cy = new Date().getFullYear();
+  const set = new Set(store.transactions.map(r => r.date.slice(0, 4)));
+  set.add(String(cy)); set.add(String(cy - 1));
+  const years = [...set].sort();
+  const a = $("analyticsYearSelect"), c = $("compareYearSelect");
+  const keep = (el, def) => (years.includes(el.value) ? el.value : def);
+  const v1 = keep(a, String(cy)), v2 = keep(c, String(cy - 1));
+  const opts = years.map(y => `<option value="${y}">${y}</option>`).join("");
+  a.innerHTML = opts; c.innerHTML = opts;
+  a.value = v1; c.value = v2;
 
-  $("analyticsYearSelect").innerHTML = years.map(y => `<option value="${y}" ${y === "2026" ? "selected" : ""}>${y}</option>`).join("");
-  $("compareYearSelect").innerHTML = years.map(y => `<option value="${y}" ${y === "2025" ? "selected" : ""}>${y}</option>`).join("");
-
-  const y1 = $("analyticsYearSelect").value;
-  const y2 = $("compareYearSelect").value;
-
-  const y1Tx = store.transactions.filter(r => r.date.startsWith(y1));
-  const y2Tx = store.transactions.filter(r => r.date.startsWith(y2));
-
-  const y1Exp = y1Tx.filter(r => r.type === "expense").reduce((a, b) => a + b.amount, 0);
-  const y2Exp = y2Tx.filter(r => r.type === "expense").reduce((a, b) => a + b.amount, 0);
-
-  const diffPct = y2Exp ? (((y1Exp - y2Exp) / y2Exp) * 100).toFixed(1) : 0;
+  const sum = (rows, type) => rows.filter(r => r.type === type).reduce((s, r) => s + r.amount, 0);
+  const y1Tx = store.transactions.filter(r => r.date.startsWith(v1));
+  const y2Tx = store.transactions.filter(r => r.date.startsWith(v2));
+  const y1Exp = sum(y1Tx, "expense"), y2Exp = sum(y2Tx, "expense");
+  const y1Inc = sum(y1Tx, "income"), y2Inc = sum(y2Tx, "income");
+  const diff = y2Exp ? ((y1Exp - y2Exp) / y2Exp) * 100 : 0;
 
   $("comparisonReport").innerHTML = `
-    <h3>${y2} VS ${y1}</h3>
-    <p>ปี ${y1} ใช้จ่ายรวม <strong>${money(y1Exp)}</strong> (ปี ${y2} ใช้จ่าย <strong>${money(y2Exp)}</strong>)</p>
-    <p>แนวโน้มค่าใช้จ่าย: <strong class="${diffPct > 0 ? 'exp' : 'inc'}">${diffPct > 0 ? '+' : ''}${diffPct}%</strong> จากปีเปรียบเทียบ</p>
+    <h3>${v2} VS ${v1}</h3>
+    <p>ปี ${v1} ใช้จ่ายรวม <strong>${money(y1Exp)}</strong> (ปี ${v2} ใช้จ่าย <strong>${money(y2Exp)}</strong>)</p>
+    <p>ปี ${v1} รายรับรวม <strong>${money(y1Inc)}</strong> (ปี ${v2} รายรับ <strong>${money(y2Inc)}</strong>)</p>
+    <p>แนวโน้มค่าใช้จ่าย: <strong class="${diff > 0 ? 'exp' : 'inc'}">${diff > 0 ? '+' : ''}${diff.toFixed(1)}%</strong> จากปีเปรียบเทียบ</p>
   `;
 }
 
@@ -552,13 +823,13 @@ function renderSettings() {
       .filter(r => r.date.startsWith(thisMK) && r.category === b.category && r.type === "expense")
       .reduce((acc, r) => acc + r.amount, 0);
 
-    const pct = Math.min(100, Math.round((spent / b.amount) * 100));
+    const pct = pctOf(spent, b.amount);
     return `<div class="budget-card" style="margin-bottom:10px; padding:10px; border:1px solid var(--line); border-radius:10px;">
       <div class="budget-head" style="display:flex; justify-content:space-between; align-items:center;">
         <span>${esc(b.category)}</span>
         <div>
           <strong>${money(spent)} / ${money(b.amount)} (${pct}%)</strong>
-          <button onclick="delBudget('${b.id}')" class="icon-sm delete" style="margin-left:8px;" title="ลบงบ">🗑️</button>
+          <button data-act="del-budget" data-id="${esc(b.id)}" class="icon-sm delete" style="margin-left:8px;" title="ลบงบ">🗑️</button>
         </div>
       </div>
       <div class="progress-bar"><div class="fill ${pct >= 100 ? 'danger' : ''}" style="width:${pct}%"></div></div>
@@ -568,15 +839,15 @@ function renderSettings() {
 
   if (!store.goals) store.goals = [];
   $("goalsList").innerHTML = store.goals.map(g => {
-    const pct = Math.min(100, Math.round((g.currentAmount / g.targetAmount) * 100));
+    const pct = pctOf(g.currentAmount, g.targetAmount);
     return `<div class="goal-card" style="margin-bottom:10px; padding:10px; border:1px solid var(--line); border-radius:10px;">
       <div style="display:flex; justify-content:space-between; align-items:center;">
         <h4>🎯 ${esc(g.title)}</h4>
-        <button onclick="delGoal('${g.id}')" class="icon-sm delete" title="ลบเป้าหมาย">🗑️</button>
+        <button data-act="del-goal" data-id="${esc(g.id)}" class="icon-sm delete" title="ลบเป้าหมาย">🗑️</button>
       </div>
       <p>${money(g.currentAmount)} / ${money(g.targetAmount)} (${pct}%)</p>
       <div class="progress-bar"><div class="fill" style="width:${pct}%"></div></div>
-      <small>กำหนดเดดไลน์: ${g.deadline}</small>
+      <small>กำหนดเดดไลน์: ${esc(g.deadline)}</small> <button data-act="goal-add" data-id="${esc(g.id)}" class="icon-sm" style="margin-left:8px;">＋ เพิ่มเงินออม</button>
     </div>`;
   }).join("") || `<p class="muted">ยังไม่มีเป้าหมายการเงิน</p>`;
 
@@ -587,17 +858,20 @@ function renderSettings() {
         <strong>${esc(r.title)}</strong> (${money(r.amount)})
         <div><small class="muted">จ่ายทุกวันที่ ${r.dayOfMonth} ของเดือน • ${esc(r.category)}</small></div>
       </div>
-      <button onclick="delRecurring('${r.id}')" class="icon-sm delete" title="ลบรายการประจำ">🗑️ ลบ</button>
+      <button data-act="del-rec" data-id="${esc(r.id)}" class="icon-sm delete" title="ลบรายการประจำ">🗑️ ลบ</button>
     </div>
   `).join("") || `<p class="muted">ยังไม่มีรายการประจำ</p>`;
 }
 
 // ==================== EVENT BINDINGS ====================
 document.addEventListener("DOMContentLoaded", () => {
-  if ($("date")) $("date").valueAsDate = new Date();
+  if ($("date")) $("date").value = todayStr();
 
   document.querySelectorAll(".nav-item").forEach(btn => {
-    btn.addEventListener("click", () => switchTab(btn.dataset.tab));
+    btn.addEventListener("click", () => {
+      if (btn.dataset.tab === "add") resetTxForm();
+      switchTab(btn.dataset.tab);
+    });
   });
 
   $("viewListBtn").addEventListener("click", () => {
@@ -666,7 +940,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     if (txId) {
       const idx = store.transactions.findIndex(r => r.id === txId);
-      if (idx !== -1) store.transactions[idx] = payload;
+      if (idx !== -1) store.transactions[idx] = { ...payload, createdAt: store.transactions[idx].createdAt };
     } else {
       store.transactions.push(payload);
     }
@@ -674,7 +948,7 @@ document.addEventListener("DOMContentLoaded", () => {
     saveStore();
     e.target.reset();
     $("txId").value = "";
-    if ($("date")) $("date").valueAsDate = new Date();
+    if ($("date")) $("date").value = todayStr();
     $("formTxTitle").textContent = "➕ บันทึกรายการ";
 
     showToast("บันทึกข้อมูลเรียบร้อย ✓");
@@ -722,6 +996,7 @@ document.addEventListener("DOMContentLoaded", () => {
       type: $("recType").value,
       category: $("recCategory").value,
       dayOfMonth: Number($("recDay").value),
+      walletId: $("recWallet").value,
       lastGeneratedMonth: ""
     });
     saveStore();
@@ -743,10 +1018,22 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Sync Buttons
   $("syncNowBtn").addEventListener("click", () => {
-    syncToCloud();
-    showToast("ส่งข้อมูลขึ้น Cloud แล้ว ✓");
+    if (cloudReady) pushStore().then(() => showToast("ส่งข้อมูลขึ้น Cloud แล้ว ✓"));
+    else initialSync();
   });
-  $("pullCloudBtn").addEventListener("click", pullFromCloud);
+  $("pullCloudBtn").addEventListener("click", () => pullFromCloud());
+  $("googleLoginBtn").addEventListener("click", googleLogin);
+  $("logoutBtn").addEventListener("click", logout);
+  $("recType").addEventListener("change", updateDropdowns);
+
+  // ปุ่มในรายการ (แทน onclick inline)
+  document.addEventListener("click", e => {
+    const el = e.target.closest("[data-act]");
+    if (!el) return;
+    const actions = { edit: editTx, del: delTx, day: selectCalDay, "del-budget": delBudget, "del-goal": delGoal, "del-rec": delRecurring, "goal-add": addGoalAmount };
+    const fn = actions[el.dataset.act];
+    if (fn) fn(el.dataset.id);
+  });
 
   // Backup & Restore
   $("exportJsonBtn").addEventListener("click", () => {
@@ -758,15 +1045,21 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   $("exportCsvBtn").addEventListener("click", () => {
-    let csv = "ID,Type,Amount,Title,Category,Date,Note\n";
-    store.transactions.forEach(r => {
-      csv += `"${r.id}","${r.type}",${r.amount},"${r.title}","${r.category}","${r.date}","${r.note || ""}"\n`;
-    });
+    const cell = v => {
+      let s = String(v ?? "");
+      if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+      return `"${s.replace(/"/g, '""')}"`;
+    };
+    const wName = id => (store.wallets.find(w => w.id === id) || {}).name || "";
+    const rows = [["ID", "Type", "Amount", "Title", "Category", "Wallet", "Date", "Note"]];
+    store.transactions.forEach(r => rows.push([r.id, r.type, r.amount, r.title, r.category, wName(r.walletId), r.date, r.note || ""]));
+    const csv = "\uFEFF" + rows.map(row => row.map((v, i) => (i === 2 ? v : cell(v))).join(",")).join("\r\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `moneysync-transactions-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.download = `moneysync-transactions-${todayStr()}.csv`;
     a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   });
 
   $("importJsonInput").addEventListener("change", e => {
@@ -779,7 +1072,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const imported = JSON.parse(evt.target.result);
         if (imported.transactions && Array.isArray(imported.transactions)) {
           if (confirm("ต้องการนำเข้าข้อมูล? ข้อมูลเดิมจะถูกรวมกับข้อมูลใหม่")) {
-            store.transactions = [...store.transactions, ...imported.transactions];
+            store = mergeStores(store, normalizeStore(imported));
             saveStore();
             renderAll();
             showToast("นำเข้าข้อมูลเรียบร้อย ✓");
@@ -794,15 +1087,20 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Theme
   const savedTheme = localStorage.getItem(THEME_KEY);
-  if (savedTheme === "dark") document.body.classList.add("dark");
+  const prefersDark = window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches;
+  if (savedTheme === "dark" || (!savedTheme && prefersDark)) document.body.classList.add("dark");
+  $("themeBtn").textContent = document.body.classList.contains("dark") ? "☀️" : "☾";
 
   $("themeBtn").addEventListener("click", () => {
     document.body.classList.toggle("dark");
     const isDark = document.body.classList.contains("dark");
     localStorage.setItem(THEME_KEY, isDark ? "dark" : "light");
-    $("themeBtn").textContent = isDark ? "☀️ เปลี่ยนเป็นธีมสว่าง" : "☾ เปลี่ยนเป็นธีมมืด";
+    $("themeBtn").textContent = isDark ? "☀️" : "☾";
   });
 
+  if (processRecurring()) saveStore();
   renderAll();
-  setTimeout(syncToCloud, 1500); // ซิงค์ครั้งแรกอัตโนมัติเมื่อเปิดแอป
+  updateAccountUI();
+  if (auth) auth.onAuthStateChanged(() => { updateAccountUI(); initialSync(); });
+  else setSyncStatus("🔴 ออฟไลน์ (โหลด Firebase ไม่สำเร็จ)");
 });
