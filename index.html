@@ -11,10 +11,10 @@
   <link href="https://fonts.googleapis.com/css2?family=Prompt:wght@400;500;600;700&display=swap" rel="stylesheet">
   
   <link rel="stylesheet" href="style.css">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 
   <!-- Firebase SDK Compat -->
   <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-database-compat.js"></script>
 </head>
 <body>
@@ -27,7 +27,7 @@
       <h1 id="pageTitle">🏠 หน้าหลัก</h1>
     </div>
     <div class="topbar-actions">
-      <button id="themeBtn" class="icon-btn" aria-label="เปลี่ยนธีม">☾ เปลี่ยนเป็นธีมมืด</button>
+      <button id="themeBtn" class="icon-btn" aria-label="เปลี่ยนธีม">☾</button>
     </div>
   </header>
 
@@ -189,6 +189,7 @@
         <div style="margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap;">
           <button id="syncNowBtn" class="primary" style="flex:1;">🔄 ซิงค์ข้อมูลเดี๋ยวนี้</button>
           <button id="pullCloudBtn" class="secondary" style="flex:1;">📥 ดึงข้อมูลล่าสุดจาก Cloud</button>
+          <button id="googleLoginBtn" class="secondary" style="flex-basis:100%;">🔐 ล็อกอินด้วย Google (ซิงค์ข้ามเครื่อง)</button>
         </div>
       </div>
 
@@ -197,7 +198,7 @@
         <div class="panel-head"><h2>💰 จัดการงบประมาณ (Budget)</h2></div>
         <form id="budgetForm" class="row-form">
           <select id="budgetCategorySelect"></select>
-          <input type="number" id="budgetAmount" placeholder="งบประมาณ (บาท)" required>
+          <input type="number" id="budgetAmount" min="1" step="0.01" placeholder="งบประมาณ (บาท)" required>
           <button class="primary" type="submit">ตั้งงบ</button>
         </form>
         <div id="budgetProgressList" class="budget-list" style="margin-top: 14px;"></div>
@@ -208,8 +209,8 @@
         <div class="panel-head"><h2>🎯 เป้าหมายการเงิน (Goals)</h2></div>
         <form id="goalForm">
           <label>ชื่อเป้าหมาย<input id="goalTitle" placeholder="เช่น ซื้อรถ, เงินสำรอง" required></label>
-          <label>จำนวนเงินเป้าหมาย<input id="goalTarget" type="number" required></label>
-          <label>เก็บได้แล้ว<input id="goalCurrent" type="number" value="0"></label>
+          <label>จำนวนเงินเป้าหมาย<input id="goalTarget" type="number" min="1" step="0.01" required></label>
+          <label>เก็บได้แล้ว<input id="goalCurrent" type="number" min="0" step="0.01" value="0"></label>
           <label>วันสิ้นสุดเป้าหมาย<input id="goalDeadline" type="date" required></label>
           <button class="primary" type="submit">สร้างเป้าหมาย</button>
         </form>
@@ -221,9 +222,10 @@
         <div class="panel-head"><h2>🔄 รายการประจำ (Recurring)</h2></div>
         <form id="recurringForm">
           <label>ชื่อรายการ<input id="recTitle" placeholder="เช่น Netflix, ค่าเช่าห้อง" required></label>
-          <label>จำนวนเงิน<input id="recAmount" type="number" placeholder="จำนวนเงิน" required></label>
+          <label>จำนวนเงิน<input id="recAmount" type="number" min="0.01" step="0.01" placeholder="จำนวนเงิน" required></label>
           <label>ประเภท<select id="recType"><option value="expense">รายจ่าย</option><option value="income">รายรับ</option></select></label>
           <label>หมวดหมู่<select id="recCategory"></select></label>
+          <label>บัญชีการเงิน<select id="recWallet"></select></label>
           <label>จ่ายทุกวันที่: <input id="recDay" type="number" min="1" max="31" value="15" required></label>
           <button class="primary" type="submit">เพิ่มรายการประจำ</button>
         </form>
@@ -272,7 +274,7 @@
 </div>
 
 <!-- Toast Notification with Undo -->
-<div id="toast" class="toast">
+<div id="toast" class="toast" role="status" aria-live="polite">
   <span id="toastMsg"></span>
   <button id="undoBtn" class="undo-btn hidden">ย้อนกลับ (Undo)</button>
 </div>
